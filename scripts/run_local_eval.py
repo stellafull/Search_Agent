@@ -16,7 +16,8 @@ from src.agents import solve  # noqa: E402
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 QUESTIONS_PATH = DATA_DIR / "question.jsonl"
 OUTPUT_PATH = DATA_DIR / "answer.jsonl"
-EVAL_WORKERS = int(os.getenv("EVAL_WORKERS", "8"))
+BATCH_SIZE = int(os.getenv("EVAL_BATCH", "5"))
+EVAL_WORKERS = int(os.getenv("EVAL_WORKERS", str(BATCH_SIZE)))
 
 
 def load_questions(path: Path) -> List[Dict]:
@@ -38,21 +39,23 @@ def main() -> None:
     if error_log.exists():
         error_log.unlink()
 
-    with futures.ThreadPoolExecutor(max_workers=EVAL_WORKERS) as executor:
-        future_map = {
-            executor.submit(solve, row["question"]): idx
-            for idx, row in enumerate(questions)
-        }
-        for fut in futures.as_completed(future_map):
-            idx = future_map[fut]
-            row = questions[idx]
-            try:
-                answer = fut.result()
-            except Exception as exc:
-                answer = ""
-                with error_log.open("a", encoding="utf-8") as logf:
-                    logf.write(f"id={row['id']} error={exc!r}\n")
-            results[idx] = {"id": row["id"], "answer": answer}
+    for start in range(0, len(questions), BATCH_SIZE):
+        batch = questions[start : start + BATCH_SIZE]
+        with futures.ThreadPoolExecutor(max_workers=EVAL_WORKERS) as executor:
+            future_map = {
+                executor.submit(solve, row["question"]): idx
+                for idx, row in enumerate(batch, start=start)
+            }
+            for fut in futures.as_completed(future_map):
+                idx = future_map[fut]
+                row = questions[idx]
+                try:
+                    answer = fut.result()
+                except Exception as exc:
+                    answer = ""
+                    with error_log.open("a", encoding="utf-8") as logf:
+                        logf.write(f"id={row['id']} error={exc!r}\n")
+                results[idx] = {"id": row["id"], "answer": answer}
 
     with OUTPUT_PATH.open("w", encoding="utf-8") as f:
         for row in results:
