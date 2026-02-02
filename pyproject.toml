@@ -1,0 +1,40 @@
+[project]
+name = "tianchi"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "arxiv>=2.4.0",
+    "fastapi[standard]>=0.128.0",
+    "fastembed>=0.7.4",
+    "langchain>=1.2.7",
+    "langchain-anthropic>=1.3.1",
+    "langchain-community>=0.4.1",
+    "langchain-core>=1.2.7",
+    "langchain-mcp-adapters>=0.2.1",
+    "langchain-openai>=1.1.7",
+    "langchain-text-splitters>=0.2.1",
+    "langgraph>=1.0.7",
+    "langgraph-cli[inmem]>=0.4.12",
+    "pydantic>=2.12.5",
+    "qdrant-client>=1.9.1",
+    "redis>=7.1.0",
+    "unstructured[pdf]>=0.13.0",
+    "numba>=0.59.0",
+    "requests>=2.32.0",
+    "python-dotenv>=1.0.1",
+    "dashscope>=1.17.1",
+    "alibabacloud_iqs20241111>=1.0.0",
+    "alibabacloud_tea_openapi>=0.3.9",
+    "alibabacloud_tea_util>=0.3.9",
+    "tavily>=1.1.0",
+    "langchain-tavily>=0.2.17",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
