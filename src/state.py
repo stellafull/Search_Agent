@@ -1,132 +1,59 @@
 from __future__ import annotations
 
-from typing import Annotated, Any, Dict, List, TypedDict
+from typing import List, Optional, TypedDict
 
 from pydantic import BaseModel, Field
 
 
-def merge_lists(a: List[Any] | None, b: List[Any] | None) -> List[Any]:
-    return (a or []) + (b or [])
-
-
-def merge_context(a: str | None, b: str | None) -> str:
-    if not a:
-        return b or ""
-    if not b:
-        return a
-    if b in a:
-        return a
-    return f"{a}\n{b}"
-
-
-class SubQuestion(TypedDict, total=False):
-    id: str
-    question: str
-    rationale: str
-    expected_evidence: str
-
-
-class SubQuestionSchema(BaseModel):
-    id: str = "SQ1"
-    question: str = ""
-    rationale: str = ""
-    expected_evidence: str = ""
-
-    model_config = {"extra": "ignore"}
-
-
-class PlannerOutput(BaseModel):
-    status: str = "search"
-    subquestions: List[SubQuestionSchema] = Field(default_factory=list)
-    final_answer: str = ""
-
-    model_config = {"extra": "ignore"}
-
-
-class SearchPlanItem(TypedDict, total=False):
-    subquestion_id: str
-    subquestion: str
-    iqs_queries: List[str]
-    tavily_queries: List[str]
-    notes: str
-
-
-class QueryGenOutput(BaseModel):
-    lang: str = "mix"
-    iqs_queries: List[str] = Field(default_factory=list)
-    tavily_queries: List[str] = Field(default_factory=list)
-    notes: str = ""
-
-    model_config = {"extra": "ignore"}
-
-
-class SearchResult(TypedDict, total=False):
-    source: str
-    query: str
-    title: str
-    url: str
-    snippet: str
-    raw: Any
-
-
-class FactItem(TypedDict, total=False):
-    fact: str
-    why_accepted: str
-    evidence: List[Dict[str, str]]
-
-
-class EvidenceSchema(BaseModel):
-    source: str = ""
+class SearchResultItem(BaseModel):
+    """A search result item (URL omitted to save tokens)."""
     title: str = ""
-    url: str = ""
     snippet: str = ""
+    source: str = ""
 
-    model_config = {"extra": "ignore"}
 
-
-class FactItemSchema(BaseModel):
+class Evidence(BaseModel):
+    """A verified fact extracted from search results."""
     fact: str = ""
-    why_accepted: str = ""
-    evidence: List[EvidenceSchema] = Field(default_factory=list)
-
-    model_config = {"extra": "ignore"}
 
 
-class RejectedItem(TypedDict, total=False):
-    claim: str
-    issue: str
-    next_step_hint: str
+class ToolStep(BaseModel):
+    tool: str
+    query: str
+    num_results: int
+    notes: Optional[str] = None
 
 
-class RejectedItemSchema(BaseModel):
-    claim: str = ""
-    issue: str = ""
-    next_step_hint: str = ""
-
-    model_config = {"extra": "ignore"}
+class FailureEvent(BaseModel):
+    reason: str
+    detail: Optional[str] = None
 
 
-class ReasonerOutput(BaseModel):
-    accepted_facts: List[FactItemSchema] = Field(default_factory=list)
-    rejected_or_uncertain: List[RejectedItemSchema] = Field(default_factory=list)
-    context_update: str = ""
-    should_continue: bool = True
-    next_subquestions_hint: List[str] = Field(default_factory=list)
-    draft_final_answer: str = ""
-
-    model_config = {"extra": "ignore"}
-
-
-class GraphState(TypedDict, total=False):
+class AgentState(TypedDict, total=False):
+    # === Core input ===
     question: str
-    context: Annotated[str, merge_context]
-    planner: Dict[str, Any]
-    subquestions: List[SubQuestion]
-    search_plan: List[SearchPlanItem]
-    search_results: List[SearchResult]
-    accepted_facts: Annotated[List[FactItem], merge_lists]
-    rejected_or_uncertain: Annotated[List[RejectedItem], merge_lists]
-    should_continue: bool
-    draft_final_answer: str
-    answer: str
-    iterations: int
+
+    # === Accumulated knowledge (used in prompts) ===
+    known_facts: List[Evidence]  # Confirmed facts with evidence
+
+    # === Current hop state (reset each hop, used in prompts) ===
+    current_gap: str  # Current gap being addressed
+    current_queries: List[str]  # Queries for this hop
+    current_tool_hint: Optional[str]  # Tool hint for this hop
+    search_results: List[SearchResultItem]  # Results for THIS hop only (not accumulated)
+
+    # === Control flow state ===
+    last_gap: Optional[str]  # Previous gap (for detecting stuck)
+    last_verdict: Optional[str]  # PASS/WEAK/FAIL from last critique
+    reflection: Optional[str]  # Active reflection strategy
+    reflection_ttl: int  # Hops remaining for reflection
+    loop_count: int  # Total hops executed
+    no_delta_streak: int  # Consecutive hops without new facts
+    weak_streak: int  # Consecutive WEAK verdicts (even with facts) - triggers reflect if too high
+
+    # === Internal tracking (NOT passed to LLM prompts) ===
+    _query_history: List[str]  # All queries ever made (for dedup only)
+    _tool_steps: List[ToolStep]  # Debug log (not sent to LLM)
+
+    # === Output ===
+    final_answer: Optional[str]

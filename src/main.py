@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from src.agents import solve_async
+from src.agents import solve
 
-
-class SolveRequest(BaseModel):
-    question: str
+app = FastAPI(title="PAI-LangStudio Research Agent", version="0.1.0")
 
 
-class SolveResponse(BaseModel):
-    answer: str
+class QuestionRequest(BaseModel):
+    question: str = Field(..., description="Input question string")
 
 
-app = FastAPI()
+class AnswerResponse(BaseModel):
+    answer: str = Field(..., description="Normalized answer")
 
 
 @app.get("/health")
@@ -22,7 +21,16 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/solve", response_model=SolveResponse)
-async def solve(req: SolveRequest) -> SolveResponse:
-    answer = await solve_async(req.question)
-    return SolveResponse(answer=answer)
+@app.post("/")
+async def root_solve(payload: QuestionRequest) -> AnswerResponse:
+    return AnswerResponse(answer=solve(payload.question))
+
+
+@app.post("/solve")
+async def solve_question(payload: QuestionRequest) -> AnswerResponse:
+    return AnswerResponse(answer=solve(payload.question))
+
+
+@app.post("/predict")
+async def predict(payload: QuestionRequest) -> AnswerResponse:
+    return AnswerResponse(answer=solve(payload.question))
