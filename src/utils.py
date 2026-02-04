@@ -1,95 +1,207 @@
 from __future__ import annotations
 
-import ast
+import asyncio
 import json
+import logging
 import os
 import re
 import unicodedata
-from typing import Any, Dict, Iterable, List, Optional
+from difflib import SequenceMatcher
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from dotenv import find_dotenv, load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from src.state import Evidence, SearchResultItem, ToolStep
+
 _ = load_dotenv(find_dotenv())
 
-# ========= LLMs =========
+logger = logging.getLogger(__name__)
 
-extract_model = init_chat_model(
-    model=os.getenv("EXTRACT_MODEL", "Qwen/Qwen3-VL-8B-Thinking"),
-    model_provider=os.getenv("LLM_PROVIDER", "openai"),
-    base_url=os.getenv("LLM_BASE_URL"),
-    api_key=os.getenv("LLM_API_KEY"),
-    temperature=0,
-)
+MAX_QUERY_LEN = int(os.getenv("MAX_QUERY_LEN", "200"))  # Allow longer queries for complex topics
+MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "6"))
+MAX_RESULTS_TOTAL = int(os.getenv("MAX_RESULTS_TOTAL", "18"))
+SIMILARITY_THRESHOLD = float(os.getenv("QUERY_SIM_THRESHOLD", "0.9"))
+IQS_DISABLED = os.getenv("IQS_DISABLED", "1").lower() not in {"0", "false", "no"}
 
-
-# ========= JSON helpers =========
-
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|```$", re.IGNORECASE | re.MULTILINE)
+# ========= LLM factory =========
 
 
-def _strip_code_fence(text: str) -> str:
-    return _CODE_FENCE_RE.sub("", text).strip()
+def build_llm(
+    model: str, temperature: float = 0.0, max_tokens: Optional[int] = None
+):
+    if max_tokens is None:
+        try:
+            max_tokens = int(os.getenv("LLM_MAX_TOKENS", "512"))
+        except ValueError:
+            max_tokens = 512
+    kwargs = {
+        "model": model,
+        "model_provider": os.getenv("LLM_PROVIDER", "openai"),
+        "base_url": os.getenv("LLM_BASE_URL"),
+        "api_key": os.getenv("LLM_API_KEY"),
+        "temperature": temperature,
+    }
+    if max_tokens and max_tokens > 0:
+        kwargs["max_tokens"] = max_tokens
+    return init_chat_model(**kwargs)
 
 
-def safe_json_loads(text: Any) -> Any:
-    if isinstance(text, (dict, list)):
-        return text
+# ========= Text helpers =========
+
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def truncate_text(text: str, max_len: int = 240) -> str:
     if text is None:
-        return {}
-    raw = str(text).strip()
-    if not raw:
-        return {}
-    raw = _strip_code_fence(raw)
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-
-    match = re.search(r"\{.*\}|\[.*\]", raw, re.DOTALL)
-    if match:
-        snippet = match.group(0)
-        try:
-            return json.loads(snippet)
-        except Exception:
-            pass
-        try:
-            return ast.literal_eval(snippet)
-        except Exception:
-            pass
-
-    fixed = raw.replace("\n", " ").replace("\t", " ")
-    fixed = re.sub(r"(?<!\\)'", '"', fixed)
-    try:
-        return json.loads(fixed)
-    except Exception:
-        return {}
-
-
-# ========= Normalization =========
+        return ""
+    text = normalize_whitespace(text)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
 
 
 def normalize_answer(text: str) -> str:
     if text is None:
         return ""
-    text = str(text).strip().lower()
-    if not text:
-        return ""
+    text = normalize_whitespace(text)
+    text = text.casefold()
+    # Remove unicode punctuation and symbols, keep letters/numbers/whitespace/CJK
     cleaned = []
     for ch in text:
-        if ch.isspace():
-            cleaned.append(" ")
-            continue
         cat = unicodedata.category(ch)
         if cat.startswith("P") or cat.startswith("S"):
             continue
         cleaned.append(ch)
-    normalized = re.sub(r"\s+", " ", "".join(cleaned)).strip()
-    return normalized
+    text = "".join(cleaned)
+    text = normalize_whitespace(text)
+    return text
 
 
-# ========= Search tools (MCP) =========
+# ========= Query guardrails =========
+
+
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def validate_query(
+    query: str,
+    previous_queries: Sequence[str],
+    current_gap: Optional[str] = None,
+) -> Tuple[bool, str]:
+    query = normalize_whitespace(query)
+    if not query:
+        return False, "empty"
+    if len(query) > MAX_QUERY_LEN:
+        return False, "too_long"
+    for prev in previous_queries:
+        if _similarity(query, prev) >= SIMILARITY_THRESHOLD:
+            return False, "too_similar"
+    if current_gap:
+        quoted_terms = re.findall(r"[\"'“”‘’]([^\"'“”‘’]+)[\"'“”‘’]", current_gap)
+        if quoted_terms:
+            if not any(term in query for term in quoted_terms):
+                return False, "missing_quoted_terms"
+    return True, "ok"
+
+
+# Common filler words that hurt search quality when at the start
+_QUERY_STRIP_PREFIXES = re.compile(
+    r"^(the|a|an|this|that|what|which|find|search|identify|locate|determine)\s+",
+    re.IGNORECASE
+)
+
+
+def rewrite_query(query: str, current_gap: Optional[str] = None) -> str:
+    query = normalize_whitespace(query)
+    
+    # Remove filler prefixes that hurt search quality
+    # e.g., "The specific paper title..." -> "specific paper title..."
+    query = _QUERY_STRIP_PREFIXES.sub("", query)
+    query = normalize_whitespace(query)
+    
+    # Remove brackets and parentheses
+    query = re.sub(r"[()\[\]{}]", " ", query)
+    query = normalize_whitespace(query)
+    
+    # Truncate at word boundary if too long
+    if len(query) > MAX_QUERY_LEN:
+        truncated = query[:MAX_QUERY_LEN]
+        last_space = truncated.rfind(" ")
+        if last_space > MAX_QUERY_LEN // 2:  # Only if we keep at least half
+            query = truncated[:last_space]
+        else:
+            query = truncated
+    
+    query = normalize_whitespace(query)
+    if current_gap and len(query) < 6:
+        query = normalize_whitespace(f"{current_gap} {query}")
+    return query
+
+
+def dedup_queries(queries: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for q in queries:
+        qn = normalize_whitespace(q)
+        if not qn or qn in seen:
+            continue
+        seen.add(qn)
+        out.append(qn)
+    return out
+
+
+# ========= Fact/rendering helpers =========
+
+# Context budget controls - tune these to balance completeness vs token efficiency
+MAX_FACTS_FOR_LLM = int(os.getenv("MAX_FACTS_FOR_LLM", "8"))  # Most recent facts
+
+
+def format_facts(facts: Sequence[Evidence], max_facts: int = MAX_FACTS_FOR_LLM) -> str:
+    """Format known facts for LLM consumption, limiting context size."""
+    if not facts:
+        return "(none)"
+    lines = []
+    # Show most recent facts first (more relevant)
+    display_facts = facts[-max_facts:] if len(facts) > max_facts else facts
+    for idx, fact in enumerate(display_facts, start=1):
+        # Compact format: just the fact (no source info to save tokens)
+        lines.append(f"{idx}. {fact.fact}")
+    if len(facts) > max_facts:
+        lines.insert(0, f"(showing {max_facts} of {len(facts)} facts)")
+    return "\n".join(lines)
+
+
+# Default limits for search results - can be overridden per-call
+MAX_RESULTS_FOR_LLM = int(os.getenv("MAX_RESULTS_FOR_LLM", "6"))
+MAX_SNIPPET_LEN = int(os.getenv("MAX_SNIPPET_LEN", "150"))
+
+
+def format_search_results(
+    results: Sequence[SearchResultItem],
+    max_results: int = MAX_RESULTS_FOR_LLM,
+    max_snippet_len: int = MAX_SNIPPET_LEN,
+) -> str:
+    """Format search results for LLM consumption, limiting context size."""
+    if not results:
+        return "(none)"
+    lines = []
+    for idx, item in enumerate(results[:max_results], start=1):
+        title = truncate_text(item.title or "", 60)
+        snippet = truncate_text(item.snippet or "", max_snippet_len)
+        # Omit URL to save tokens - source is enough for credibility
+        source = item.source or "search"
+        lines.append(f"{idx}. [{source}] {title}: {snippet}")
+    if len(results) > max_results:
+        lines.append(f"... ({len(results) - max_results} more results omitted)")
+    return "\n".join(lines)
+
+
+# ========= Search tools (MCP + direct) =========
 
 _TAVILY_TOOLS: Optional[list] = None
 _IQS_TOOLS: Optional[list] = None
@@ -115,12 +227,15 @@ async def get_tavily_mcp_tools():
             }
         )
         _TAVILY_TOOLS = await client.get_tools(server_name="tavily-remote-mcp")
-    except Exception:
+    except Exception as exc:
+        logger.warning("tavily mcp init failed: %s", exc)
         _TAVILY_TOOLS = []
     return _TAVILY_TOOLS
 
 
 async def get_iqs_mcp_tools():
+    if IQS_DISABLED:
+        return []
     global _IQS_TOOLS
     if _IQS_TOOLS is not None:
         return _IQS_TOOLS
@@ -137,241 +252,191 @@ async def get_iqs_mcp_tools():
             }
         )
         _IQS_TOOLS = await client.get_tools(server_name="iqs-mcp-server-maps")
-    except Exception:
+    except Exception as exc:
+        logger.warning("iqs mcp init failed: %s", exc)
         _IQS_TOOLS = []
     return _IQS_TOOLS
 
 
-def _pick_search_tool(tools: list) -> Any:
-    if not tools:
-        return None
-    for tool in tools:
-        if "search" in tool.name.lower():
-            return tool
-    return tools[0]
+def _extract_fields_from_schema(tool: Any) -> List[str]:
+    args_schema = getattr(tool, "args_schema", None)
+    if args_schema is None:
+        return []
+    if hasattr(args_schema, "model_fields"):
+        return list(args_schema.model_fields.keys())
+    if hasattr(args_schema, "__fields__"):
+        return list(args_schema.__fields__.keys())
+    return []
 
 
-def _build_tool_input(tool: Any, query: str, max_results: int) -> Dict[str, Any]:
+def _build_tool_payload(tool: Any, query: str, max_results: int) -> Dict[str, Any]:
+    fields = _extract_fields_from_schema(tool)
     payload: Dict[str, Any] = {}
-    schema = getattr(tool, "args_schema", None)
-    fields = set()
-    if schema is not None and hasattr(schema, "model_fields"):
-        fields = set(schema.model_fields.keys())
-    if "query" in fields:
-        payload["query"] = query
-    elif "q" in fields:
-        payload["q"] = query
-    elif "search_query" in fields:
-        payload["search_query"] = query
-    else:
-        payload["query"] = query
-    if "max_results" in fields:
-        payload["max_results"] = max_results
-    elif "limit" in fields:
-        payload["limit"] = max_results
+    if fields:
+        for name in fields:
+            lname = name.lower()
+            if lname in {"query", "q", "text", "input", "keyword", "keywords"}:
+                payload[name] = query
+            elif lname in {
+                "k",
+                "limit",
+                "top_k",
+                "max_results",
+                "num_results",
+                "count",
+            }:
+                payload[name] = max_results
+    if not payload:
+        payload = {"query": query}
     return payload
 
 
-def _normalize_results(raw: Any, source: str, query: str) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
-
-    def _add_items(items: List[Dict[str, Any]]):
-        for item in items:
-            add_item(item)
-
-    def _parse_markdown_results(text: str) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
-        if not text:
-            return items
-        blocks = re.split(r"\n---\n", text)
-        for block in blocks:
-            title_match = re.search(r"##\s*标题\s*(.+)", block)
-            if not title_match:
-                continue
-            title = title_match.group(1).strip()
-            url_match = re.search(r"\*\*url\*\*:\s*(\S+)", block)
-            snippet_match = re.search(r"\*\*摘要\*\*:\s*(.+)", block)
-            url = url_match.group(1).strip() if url_match else ""
-            snippet = snippet_match.group(1).strip() if snippet_match else ""
-            items.append({"title": title, "url": url, "snippet": snippet})
-        return items
-
-    def add_item(item: Dict[str, Any]):
-        results.append(
-            {
-                "source": source,
-                "query": query,
-                "title": str(item.get("title", "")),
-                "url": str(item.get("url", "")),
-                "snippet": str(item.get("snippet", item.get("content", ""))),
-                "raw": item,
-            }
-        )
-
-    if isinstance(raw, dict):
-        if "text" in raw and isinstance(raw["text"], str):
-            text = raw["text"].strip()
-            if text.startswith("{") and "results" in text:
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, dict) and "results" in parsed:
-                        for item in parsed["results"]:
-                            if isinstance(item, dict):
-                                add_item(item)
-                        return results
-                except Exception:
-                    pass
-            parsed_items = _parse_markdown_results(text)
-            if parsed_items:
-                _add_items(parsed_items)
-                return results
-        if "results" in raw and isinstance(raw["results"], list):
-            for item in raw["results"]:
-                if isinstance(item, dict):
-                    add_item(item)
-            return results
-        if "data" in raw and isinstance(raw["data"], list):
-            for item in raw["data"]:
-                if isinstance(item, dict):
-                    add_item(item)
-            return results
-        if "items" in raw and isinstance(raw["items"], list):
-            for item in raw["items"]:
-                if isinstance(item, dict):
-                    add_item(item)
-            return results
-        add_item(raw)
-        return results
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, dict):
-                add_item(item)
-            else:
-                add_item({"snippet": str(item)})
-        return results
-    if isinstance(raw, str):
-        text = raw.strip()
-        if text.startswith("{") and "results" in text:
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict) and "results" in parsed:
-                    for item in parsed["results"]:
-                        if isinstance(item, dict):
-                            add_item(item)
-                    return results
-            except Exception:
-                pass
-        parsed_items = _parse_markdown_results(text)
-        if parsed_items:
-            _add_items(parsed_items)
-            return results
-    add_item({"snippet": str(raw)})
-    return results
-
-
-async def tavily_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
-    tools = await get_tavily_mcp_tools()
-    tool = _pick_search_tool(tools)
-    if tool is None:
+def _parse_search_output(output: Any, source: str) -> List[SearchResultItem]:
+    if output is None:
         return []
-    payload = _build_tool_input(tool, query, max_results)
-    try:
-        raw = await tool.ainvoke(payload)
-    except Exception:
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except Exception:
+            return [SearchResultItem(title="", snippet=output, source=source)]
+    data: Any = output
+    if isinstance(output, dict):
+        for key in ("results", "items", "data", "documents", "docs"):
+            if key in output:
+                data = output[key]
+                break
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
         return []
-    return _normalize_results(raw, "tavily", query)
-
-
-async def iqs_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
-    tools = await get_iqs_mcp_tools()
-    tool = _pick_search_tool(tools)
-    if tool is None:
-        return []
-    payload = _build_tool_input(tool, query, max_results)
-    try:
-        raw = await tool.ainvoke(payload)
-    except Exception:
-        return []
-    return _normalize_results(raw, "iqs", query)
-
-
-async def search_all(
-    iqs_queries: Iterable[str],
-    tavily_queries: Iterable[str],
-    max_results: int = 5,
-) -> List[Dict[str, Any]]:
-    tasks = []
-    for q in iqs_queries:
-        if q:
-            tasks.append(iqs_search(q, max_results=max_results))
-    for q in tavily_queries:
-        if q:
-            tasks.append(tavily_search(q, max_results=max_results))
-    results: List[Dict[str, Any]] = []
-    if not tasks:
-        return results
-    for batch in await _gather_with_concurrency(tasks):
-        if isinstance(batch, list):
-            results.extend(batch)
-    return results
-
-
-async def _gather_with_concurrency(tasks: List[Any], limit: int = 6) -> List[Any]:
-    import asyncio
-
-    semaphore = asyncio.Semaphore(limit)
-
-    async def _run(task):
-        async with semaphore:
-            return await task
-
-    results = await asyncio.gather(*[_run(t) for t in tasks], return_exceptions=True)
-    cleaned: List[Any] = []
-    for item in results:
-        if isinstance(item, Exception):
+    items: List[SearchResultItem] = []
+    for idx, item in enumerate(data, start=1):
+        if isinstance(item, str):
+            items.append(
+                SearchResultItem(
+                    title="",
+                    snippet=item,
+                    source=source,
+                )
+            )
             continue
-        cleaned.append(item)
-    return cleaned
-
-
-def compact_search_results(
-    results: List[Dict[str, Any]],
-    max_items: int = 30,
-    max_snippet_chars: int = 400,
-) -> str:
-    trimmed: List[Dict[str, Any]] = []
-    for item in results[:max_items]:
-        snippet = item.get("snippet", "")
-        if isinstance(snippet, str) and max_snippet_chars > 0 and len(snippet) > max_snippet_chars:
-            snippet = snippet[:max_snippet_chars] + "..."
-        trimmed.append(
-            {
-                "source": item.get("source", ""),
-                "query": item.get("query", ""),
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "snippet": snippet,
-            }
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title") or item.get("name") or ""
+        snippet = (
+            item.get("content")
+            or item.get("snippet")
+            or item.get("text")
+            or item.get("description")
+            or ""
         )
-    return json.dumps(trimmed, ensure_ascii=False, indent=2)
+        items.append(
+            SearchResultItem(
+                title=title,
+                snippet=snippet,
+                source=source,
+            )
+        )
+    return items
 
 
-# ========= IO helpers =========
+async def _search_with_mcp_tools(
+    tools: Sequence[Any],
+    query: str,
+    source: str,
+    max_results: int,
+) -> List[SearchResultItem]:
+    if not tools:
+        return []
+    # prefer tools with search-like names
+    ordered = sorted(tools, key=lambda t: "search" not in getattr(t, "name", ""))
+    for tool in ordered:
+        payload = _build_tool_payload(tool, query, max_results)
+        try:
+            output = await tool.ainvoke(payload)
+        except Exception:
+            continue
+        items = _parse_search_output(output, source)
+        if items:
+            return items[:max_results]
+    return []
 
 
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    return rows
+SEARCH_MAX_RETRIES = int(os.getenv("SEARCH_MAX_RETRIES", "2"))
+SEARCH_RETRY_DELAY = float(os.getenv("SEARCH_RETRY_DELAY", "2.0"))
 
 
-def write_jsonl(path: str, rows: Iterable[Dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False))
-            f.write("\n")
+async def search_tavily(query: str, max_results: int = MAX_RESULTS_PER_QUERY) -> List[SearchResultItem]:
+    api_key = os.getenv("TAVILY_API_KEY")
+    if api_key:
+        for attempt in range(SEARCH_MAX_RETRIES + 1):
+            try:
+                from tavily import TavilyClient
+
+                client = TavilyClient(api_key=api_key)
+                resp = client.search(
+                    query=query,
+                    max_results=max_results,
+                    include_answer=False,
+                    include_raw_content=False,
+                )
+                results = resp.get("results") if isinstance(resp, dict) else None
+                if results:
+                    return _parse_search_output({"results": results}, "tavily")
+                break  # No results but no error, don't retry
+            except Exception as exc:
+                err_str = str(exc).lower()
+                if attempt < SEARCH_MAX_RETRIES and ("connection" in err_str or "timeout" in err_str):
+                    logger.warning("tavily search retry %d: %s", attempt + 1, exc)
+                    await asyncio.sleep(SEARCH_RETRY_DELAY * (attempt + 1))
+                    continue
+                logger.warning("tavily direct search failed: %s", exc)
+                break
+    tools = await get_tavily_mcp_tools()
+    return await _search_with_mcp_tools(tools, query, "tavily", max_results)
+
+
+async def search_iqs(query: str, max_results: int = MAX_RESULTS_PER_QUERY) -> List[SearchResultItem]:
+    if IQS_DISABLED:
+        return []
+    tools = await get_iqs_mcp_tools()
+    return await _search_with_mcp_tools(tools, query, "iqs", max_results)
+
+
+def merge_dedup_results(results: Iterable[SearchResultItem]) -> List[SearchResultItem]:
+    seen = set()
+    merged: List[SearchResultItem] = []
+    for item in results:
+        # Dedup by title + snippet prefix (URL removed)
+        snippet_prefix = item.snippet[:50] if item.snippet else ""
+        key = f"{item.title}|{snippet_prefix}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+        if len(merged) >= MAX_RESULTS_TOTAL:
+            break
+    return merged
+
+
+def build_tool_step(tool: str, query: str, num_results: int, notes: str | None = None) -> ToolStep:
+    return ToolStep(tool=tool, query=query, num_results=num_results, notes=notes)
+
+
+async def run_parallel_searches(
+    query: str, use_tavily: bool, use_iqs: bool
+) -> List[SearchResultItem]:
+    tasks = []
+    if use_tavily:
+        tasks.append(search_tavily(query))
+    if use_iqs:
+        tasks.append(search_iqs(query))
+    if not tasks:
+        return []
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    merged: List[SearchResultItem] = []
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        merged.extend(res)
+    return merged

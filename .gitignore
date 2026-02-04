@@ -12,3 +12,6 @@ wheels/
 # Environment files
 .env
 src/.env
+
+# data/
+data/*
